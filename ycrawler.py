@@ -77,7 +77,7 @@ def get_comments_links(page):
     return parser.links
 
 
-def get_store_links(page):
+def get_story_links(page):
     parser = StoryLinkParser()
     parser.feed(page)
     links = []
@@ -109,55 +109,55 @@ def write_to_file(dir_path, link, data):
         logging.error("Error saving to {}: {}".format(path, e))
 
 
-async def fetch_url(url, retries, retry_timeout):
-    timeout = aiohttp.ClientTimeout(total=30, connect=None,
-                                    sock_connect=None, sock_read=None)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            attempts = retries
-            while True:
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        return await resp.content.read()
-                    attempts -= 1
-                    if attempts <= 0:
-                        raise ConnectionError('Connection retries exceeded: {}'.format(resp.status))
-                    await asyncio.sleep(retry_timeout)
-        except Exception as e:
-            logging.error("Error geting links {}: {}".format(url, e))
+async def fetch_url(session, url, retries, retry_timeout):
+    try:
+        attempts = retries
+        while True:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.content.read()
+                attempts -= 1
+                if attempts <= 0:
+                    raise ConnectionError('Connection retries exceeded: {}'.format(resp.status))
+                await asyncio.sleep(retry_timeout)
+    except Exception as e:
+        logging.error("Error geting links {}: {}".format(url, e))
 
 
-async def save_link(semaphore, url, dir_path, pool, net_cfg):
+async def save_link(session, semaphore, url, dir_path, pool, net_cfg):
     if url.startswith(URL):
         async with semaphore:
-            page = await fetch_url(url, **net_cfg)
+            page = await fetch_url(session, url, **net_cfg)
     else:
-        page = await fetch_url(url, **net_cfg)
+        page = await fetch_url(session, url, **net_cfg)
     if page is not None:
         pool.submit(write_to_file, dir_path, url, page)
 
 
-async def save_store(semaphore, pool, base_dir,
+async def save_story(semaphore, pool, base_dir,
                      link_info, polling_cycle, net_cfg):
     dir_path = os.path.join(base_dir, link_info.id + '_' + url_to_fn(link_info.url))
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
     links = []
-    await save_link(semaphore, link_info.url, dir_path, pool, net_cfg)
-    while True:
-        try:
-            async with semaphore:
-                page = await fetch_url(COMMENT_URL.format(link_info.id), **net_cfg)
-            if page is not None:
-                new_links = get_comments_links(page.decode("utf-8"))
-                add_links = [i for i in new_links if i not in links]
-                for url in add_links:
-                    await save_link(semaphore, url, dir_path, pool, net_cfg)
-            links = new_links
-            await asyncio.sleep(polling_cycle)
-        except asyncio.CancelledError:
-            logging.debug("Task {} cancelled".format(link_info.id))
-            break
+    timeout = aiohttp.ClientTimeout(total=30, connect=None,
+                                    sock_connect=None, sock_read=None)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        await save_link(session, semaphore, link_info.url, dir_path, pool, net_cfg)
+        while True:
+            try:
+                async with semaphore:
+                    page = await fetch_url(session, COMMENT_URL.format(link_info.id), **net_cfg)
+                if page is not None:
+                    new_links = get_comments_links(page.decode("utf-8"))
+                    add_links = [i for i in new_links if i not in links]
+                    for url in add_links:
+                        await save_link(session, semaphore, url, dir_path, pool, net_cfg)
+                    links = new_links
+                await asyncio.sleep(polling_cycle)
+            except asyncio.CancelledError:
+                logging.debug("Task {} cancelled".format(link_info.id))
+                break
 
 
 async def crawler(net_cfg, data_dir, ycomb_max_conn,
@@ -165,21 +165,25 @@ async def crawler(net_cfg, data_dir, ycomb_max_conn,
     links = []
     tasks = {}
     ycomb_semaphore = asyncio.Semaphore(value=ycomb_max_conn)
-    with futures.ProcessPoolExecutor(max_workers=2) as pool:
-        while True:
-            page = await fetch_url(URL, **net_cfg)
-            if page is not None:
-                new_links = get_store_links(page.decode("utf-8"))
-                add_links = [i for i in new_links if i not in links]
-                remove_links = [i for i in links if i not in new_links]
-                for item in add_links:
-                    t = asyncio.ensure_future(save_store(ycomb_semaphore, pool, data_dir,
-                                                         item, comments_polling_cycle, net_cfg))
-                    tasks[item.id] = t
-                for item in remove_links:
-                    tasks[item.id].cancel()
-                links = new_links
-            await asyncio.sleep(polling_cycle)
+    timeout = aiohttp.ClientTimeout(total=30, connect=None,
+                                    sock_connect=None, sock_read=None)
+    with futures.ProcessPoolExecutor(max_workers=1) as pool:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while True:
+                page = await fetch_url(session, URL, **net_cfg)
+                if page is not None:
+                    new_links = get_story_links(page.decode("utf-8"))
+                    add_links = [i for i in new_links if i not in links]
+                    remove_links = [i for i in links if i not in new_links]
+                    for item in add_links:
+                        t = asyncio.ensure_future(save_story(ycomb_semaphore, pool, data_dir,
+                                                             item, comments_polling_cycle, net_cfg))
+                        tasks[item.id] = t
+                    for item in remove_links:
+                        tasks[item.id].cancel()
+                        del tasks[item.id]
+                    links = new_links
+                await asyncio.sleep(polling_cycle)
 
 
 def get_config(cfg_file):
@@ -191,7 +195,7 @@ def get_config(cfg_file):
             for opt in parser.options(sec):
                 value = parser.get(sec, opt, fallback=cfg[sec][opt])
                 if isinstance(cfg[sec][opt], (int, float)):
-                    cfg[sec][opt] = int(value)
+                    cfg[sec][opt] = float(value)
                 else:
                     cfg[sec][opt] = value
     return cfg
