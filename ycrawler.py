@@ -124,17 +124,18 @@ async def fetch_url(session, url, retries, retry_timeout):
         logging.error("Error geting links {}: {}".format(url, e))
 
 
-async def save_link(session, semaphore, url, dir_path, pool, net_cfg):
+async def save_link(session, semaphore, url, dir_path, net_cfg):
     if url.startswith(URL):
         async with semaphore:
             page = await fetch_url(session, url, **net_cfg)
     else:
         page = await fetch_url(session, url, **net_cfg)
     if page is not None:
-        pool.submit(write_to_file, dir_path, url, page)
+        with futures.ProcessPoolExecutor(max_workers=1) as pool:
+            pool.submit(write_to_file, dir_path, url, page)
 
 
-async def save_story(semaphore, pool, base_dir,
+async def save_story(semaphore, base_dir,
                      link_info, polling_cycle, net_cfg):
     dir_path = os.path.join(base_dir, link_info.id + '_' + url_to_fn(link_info.url))
     if not os.path.exists(dir_path):
@@ -143,7 +144,7 @@ async def save_story(semaphore, pool, base_dir,
     timeout = aiohttp.ClientTimeout(total=30, connect=None,
                                     sock_connect=None, sock_read=None)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        await save_link(session, semaphore, link_info.url, dir_path, pool, net_cfg)
+        await save_link(session, semaphore, link_info.url, dir_path, net_cfg)
         while True:
             try:
                 async with semaphore:
@@ -152,7 +153,7 @@ async def save_story(semaphore, pool, base_dir,
                     new_links = get_comments_links(page.decode("utf-8"))
                     add_links = [i for i in new_links if i not in links]
                     for url in add_links:
-                        await save_link(session, semaphore, url, dir_path, pool, net_cfg)
+                        await save_link(session, semaphore, url, dir_path, net_cfg)
                     links = new_links
                 await asyncio.sleep(polling_cycle)
             except asyncio.CancelledError:
@@ -163,27 +164,21 @@ async def save_story(semaphore, pool, base_dir,
 async def crawler(net_cfg, data_dir, ycomb_max_conn,
                   polling_cycle, comments_polling_cycle):
     links = []
-    tasks = {}
     ycomb_semaphore = asyncio.Semaphore(value=ycomb_max_conn)
     timeout = aiohttp.ClientTimeout(total=30, connect=None,
                                     sock_connect=None, sock_read=None)
-    with futures.ProcessPoolExecutor(max_workers=1) as pool:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            while True:
-                page = await fetch_url(session, URL, **net_cfg)
-                if page is not None:
-                    new_links = get_story_links(page.decode("utf-8"))
-                    add_links = [i for i in new_links if i not in links]
-                    remove_links = [i for i in links if i not in new_links]
-                    for item in add_links:
-                        t = asyncio.ensure_future(save_story(ycomb_semaphore, pool, data_dir,
-                                                             item, comments_polling_cycle, net_cfg))
-                        tasks[item.id] = t
-                    for item in remove_links:
-                        tasks[item.id].cancel()
-                        del tasks[item.id]
-                    links = new_links
-                await asyncio.sleep(polling_cycle)
+    loop = asyncio.get_event_loop()
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            page = await fetch_url(session, URL, **net_cfg)
+            if page is not None:
+                new_links = get_story_links(page.decode("utf-8"))
+                add_links = [i for i in new_links if i not in links]
+                for item in add_links:
+                    t = loop.create_task(save_story(ycomb_semaphore, data_dir,
+                                                    item, comments_polling_cycle, net_cfg))
+                links = new_links
+            await asyncio.sleep(polling_cycle)
 
 
 def get_config(cfg_file):
