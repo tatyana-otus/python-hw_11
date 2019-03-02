@@ -13,13 +13,16 @@ import aiohttp
 URL = 'http://news.ycombinator.com/'
 COMMENT_URL = 'https://news.ycombinator.com/item?id={}'
 
+HTTP_OK = 200
+HTTP_SERVER_CURRENTLY_UNABLE = 503
+
 LinkInfo = collections.namedtuple("LinkInfo", ["id", "url"])
 
 DEF_CONFIG_FILE_NAME = 'ycomb.cfg'
 DEF_CONFIG = {
-    'net': {'retries': 10, 'retry_timeout': 1},
-    'common': {'data_dir': 'ycombinator', 'ycomb_max_conn': 3,
-               'polling_cycle': 5, 'comments_polling_cycle': 10},
+    'net': {'retries': 5, 'retry_timeout': 1},
+    'common': {'data_dir': 'ycombinator', 'host_max_conn': 3,
+               'polling_cycle': 5},
     'log': {'filename': None}
 }
 
@@ -71,7 +74,7 @@ class CommentLinkParser(HTMLParser):
             self.inside_comment = False
 
 
-def get_comments_links(page):
+def get_comment_links(page):
     parser = CommentLinkParser()
     parser.feed(page)
     return parser.links
@@ -110,75 +113,60 @@ def write_to_file(dir_path, link, data):
 
 
 async def fetch_url(session, url, retries, retry_timeout):
-    try:
-        attempts = retries
-        while True:
+    attempts = retries
+    while True:
+        try:
             async with session.get(url) as resp:
-                if resp.status == 200:
+                if resp.status == HTTP_OK:
                     return await resp.content.read()
-                attempts -= 1
-                if attempts <= 0:
-                    raise ConnectionError('Connection retries exceeded: {}'.format(resp.status))
-                await asyncio.sleep(retry_timeout)
-    except Exception as e:
-        logging.error("Error geting links {}: {}".format(url, e))
+                elif resp.status == HTTP_SERVER_CURRENTLY_UNABLE:
+                    raise aiohttp.ClientError('HTTP error: {}'.format(resp.status))
+                else:
+                    logging.error("Error geting link {}: {}".format(url, resp.status))
+                    return None
+        except aiohttp.ClientError as e:
+            attempts -= 1
+            if attempts <= 0:
+                logging.error("Error geting link {}: {}".format(url, e))
+                return None
+            await asyncio.sleep(retry_timeout)
 
 
-async def save_link(session, semaphore, url, dir_path, net_cfg):
-    if url.startswith(URL):
-        async with semaphore:
-            page = await fetch_url(session, url, **net_cfg)
-    else:
-        page = await fetch_url(session, url, **net_cfg)
+async def save_link(session, url, dir_path, net_cfg):
+    page = await fetch_url(session, url, **net_cfg)
     if page is not None:
         with futures.ProcessPoolExecutor(max_workers=1) as pool:
             pool.submit(write_to_file, dir_path, url, page)
 
 
-async def save_story(semaphore, base_dir,
-                     link_info, polling_cycle, net_cfg):
+async def save_story(session, base_dir, link_info, net_cfg):
     dir_path = os.path.join(base_dir, link_info.id + '_' + url_to_fn(link_info.url))
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
-    links = []
-    timeout = aiohttp.ClientTimeout(total=30, connect=None,
-                                    sock_connect=None, sock_read=None)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        await save_link(session, semaphore, link_info.url, dir_path, net_cfg)
-        while True:
-            try:
-                async with semaphore:
-                    page = await fetch_url(session, COMMENT_URL.format(link_info.id), **net_cfg)
-                if page is not None:
-                    new_links = get_comments_links(page.decode("utf-8"))
-                    add_links = [i for i in new_links if i not in links]
-                    for url in add_links:
-                        await save_link(session, semaphore, url, dir_path, net_cfg)
-                    links = new_links
-                await asyncio.sleep(polling_cycle)
-            except asyncio.CancelledError:
-                logging.debug("Task {} cancelled".format(link_info.id))
-                break
+    await save_link(session, link_info.url, dir_path, net_cfg)
+    page = await fetch_url(session, COMMENT_URL.format(link_info.id), **net_cfg)
+    if page is not None:
+        links = get_comment_links(page.decode("utf-8"))
+        for url in links:
+            await save_link(session, url, dir_path, net_cfg)
 
 
-async def crawler(net_cfg, data_dir, ycomb_max_conn,
-                  polling_cycle, comments_polling_cycle):
+async def crawler(net_cfg, data_dir, host_max_conn, polling_cycle):
     links = []
-    ycomb_semaphore = asyncio.Semaphore(value=ycomb_max_conn)
-    timeout = aiohttp.ClientTimeout(total=30, connect=None,
-                                    sock_connect=None, sock_read=None)
+    timeout = aiohttp.ClientTimeout(total=30)
+    connector = aiohttp.connector.TCPConnector(limit=0, limit_per_host=host_max_conn)
     loop = asyncio.get_event_loop()
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            page = await fetch_url(session, URL, **net_cfg)
-            if page is not None:
-                new_links = get_story_links(page.decode("utf-8"))
-                add_links = [i for i in new_links if i not in links]
-                for item in add_links:
-                    t = loop.create_task(save_story(ycomb_semaphore, data_dir,
-                                                    item, comments_polling_cycle, net_cfg))
-                links = new_links
-            await asyncio.sleep(polling_cycle)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as stories_session:
+            while True:
+                page = await fetch_url(session, URL, **net_cfg)
+                if page is not None:
+                    new_links = get_story_links(page.decode("utf-8"))
+                    add_links = [i for i in new_links if i not in links]
+                    for item in add_links:
+                        loop.create_task(save_story(stories_session, data_dir, item, net_cfg))
+                    links = new_links
+                await asyncio.sleep(polling_cycle)
 
 
 def get_config(cfg_file):
